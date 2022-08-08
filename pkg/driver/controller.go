@@ -445,22 +445,33 @@ func (cs *controller) CreateVolume(
 		return nil, err
 	}
 
-	volName := strings.ToLower(req.GetName())
 	parameters := req.GetParameters()
 	// lower case keys, cf CreateZFSVolume()
 	pool := helpers.GetInsensitiveParameter(&parameters, "poolname")
 	size := getRoundedCapacity(req.GetCapacityRange().GetRequiredBytes())
 	contentSource := req.GetVolumeContentSource()
 	pvcName := helpers.GetInsensitiveParameter(&parameters, "csi.storage.k8s.io/pvc/name")
+	namespace := helpers.GetInsensitiveParameter(&parameters, "csi.storage.k8s.io/pvc/namespace")
+	/*
+		uuidReg := regexp.MustCompile(`.*-([0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}).*`)
+		uuid := uuidReg.FindStringSubmatch(strings.ToLower(req.GetName()))
+		if len(uuid) >= 2 {
+			req.Name = uuid[1]
+		}
+	*/
 
 	if contentSource != nil && contentSource.GetSnapshot() != nil {
 		snapshotID := contentSource.GetSnapshot().GetSnapshotId()
 
+		req.Name = "snapclone-" + namespace + "-" + pvcName
 		selected, err = CreateSnapClone(ctx, req, snapshotID)
 	} else if contentSource != nil && contentSource.GetVolume() != nil {
 		srcVol := contentSource.GetVolume().GetVolumeId()
+
+		req.Name = "clone-" + namespace + "-" + pvcName
 		selected, err = CreateVolClone(ctx, req, srcVol)
 	} else {
+		req.Name = "pvc-" + namespace + "-" + pvcName
 		selected, err = CreateZFSVolume(ctx, req)
 	}
 
@@ -468,6 +479,7 @@ func (cs *controller) CreateVolume(
 		return nil, err
 	}
 
+	volName := strings.ToLower(req.GetName())
 	klog.Infof("created the volume %s/%s on node %s", pool, volName, selected)
 
 	sendEventOrIgnore(pvcName, volName, strconv.FormatInt(int64(size), 10), "zfs-localpv", analytics.VolumeProvision)

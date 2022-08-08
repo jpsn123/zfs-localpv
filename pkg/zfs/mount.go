@@ -123,6 +123,45 @@ func UmountVolume(vol *apis.ZFSVolume, targetPath string,
 
 	klog.Infof("umount done %s path %v", vol.Name, targetPath)
 
+	// extend feature
+	volume := vol.Spec.PoolName + "/" + vol.Name
+	UmountPath := "/mnt/" + volume
+	dev, ref, err = mount.GetDeviceNameFromMount(mounter, UmountPath)
+	if err != nil {
+		klog.Warningf(
+			"extend : failed to get device from mnt: %s\nError: %v",
+			UmountPath, err,
+		)
+		return err
+	}
+	if len(dev) == 0 || ref == 0 {
+		klog.Infof(
+			"extend : Unmount skipped because volume %s not mounted: %v",
+			vol.Name, UmountPath,
+		)
+		return nil
+	}
+	if pathExists, pathErr := mount.PathExists(UmountPath); pathErr != nil {
+		return fmt.Errorf("Error checking if path exists: %v", pathErr)
+	} else if !pathExists {
+		klog.Warningf(
+			"extend : Unmount skipped because path does not exist: %v",
+			UmountPath,
+		)
+		return nil
+	}
+	if err = mounter.Unmount(UmountPath); err != nil {
+		klog.Warningf(
+			"extend : failed to unmount %s: path %s err: %v",
+			vol.Name, UmountPath, err,
+		)
+		return err
+	}
+	if err := os.Remove(UmountPath); err != nil {
+		klog.Warningf("extend : failed to remove mount path vol %s err : %v", vol.Name, err)
+	}
+	klog.Infof("extend : umount done %s path %v", vol.Name, UmountPath)
+
 	return nil
 }
 
@@ -238,6 +277,30 @@ func MountDataset(vol *apis.ZFSVolume, mount *MountInfo) error {
 			return status.Errorf(codes.Internal, "dataset: mount failed err : %s", string(out))
 		}
 		klog.Infof("dataset : legacy mounted %s => %s", volume, mount.MountPath)
+
+		MountVolArg = []string{}
+		MountPath := "/mnt/" + volume
+		mounted, err = verifyMountRequest(vol, MountPath)
+		if err != nil {
+			klog.Warningf("extend : error: %v", err)
+		}
+		if mounted {
+			klog.Infof("extend : already mounted %s => %s", volume, MountPath)
+		} else {
+			err = os.MkdirAll(MountPath, 0750)
+			if err != nil {
+				klog.Warningf("extend : could not create directory %s, error: %v", MountPath, err)
+			} else {
+				MountVolArg = append(MountVolArg, "-o", mntopt, "-t", "zfs", volume, MountPath)
+				cmd = exec.Command("mount", MountVolArg...)
+				out, err = cmd.CombinedOutput()
+				if err != nil {
+					klog.Warningf("extend : could not mount the dataset %v cmd %v error: %s",
+						volume, MountVolArg, string(out))
+				}
+				klog.Infof("extend : legacy mounted %s => %s", volume, MountPath)
+			}
+		}
 	} else {
 		/*
 		 * We might have created volumes and then upgraded the node agent before
