@@ -20,6 +20,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sync"
 
 	mnt "github.com/openebs/lib-csi/pkg/mount"
 	apis "github.com/openebs/zfs-localpv/pkg/apis/openebs.io/zfs/v1"
@@ -50,6 +51,9 @@ type MountInfo struct {
 	// which mount needs to be attempted
 	MountOptions []string `json:"mountOptions"`
 }
+
+var g_vol_mounted_count map[string]int = make(map[string]int)
+var g_vol_mounted_count_mutex sync.Mutex
 
 // FormatAndMountZvol formats and mounts the created volume to the desired mount path
 func FormatAndMountZvol(devicePath string, mountInfo *MountInfo) error {
@@ -134,11 +138,14 @@ func UmountVolume(vol *apis.ZFSVolume, targetPath string,
 		)
 		return err
 	}
+	g_vol_mounted_count_mutex.Lock()
+	defer g_vol_mounted_count_mutex.Unlock()
 	if len(dev) == 0 || ref == 0 {
 		klog.Infof(
 			"extend : Unmount skipped because volume %s not mounted: %v",
 			vol.Name, UmountPath,
 		)
+		g_vol_mounted_count[UmountPath] = 0
 		return nil
 	}
 	if pathExists, pathErr := mount.PathExists(UmountPath); pathErr != nil {
@@ -148,19 +155,31 @@ func UmountVolume(vol *apis.ZFSVolume, targetPath string,
 			"extend : Unmount skipped because path does not exist: %v",
 			UmountPath,
 		)
+		g_vol_mounted_count[UmountPath] = 0
 		return nil
 	}
-	if err = mounter.Unmount(UmountPath); err != nil {
-		klog.Warningf(
-			"extend : failed to unmount %s: path %s err: %v",
-			vol.Name, UmountPath, err,
-		)
-		return err
+
+	value, ok := g_vol_mounted_count[UmountPath]
+	if !ok {
+		value = 1
 	}
-	if err := os.Remove(UmountPath); err != nil {
-		klog.Warningf("extend : failed to remove mount path vol %s err : %v", vol.Name, err)
+	if value-1 <= 0 {
+		if err = mounter.Unmount(UmountPath); err != nil {
+			klog.Warningf(
+				"extend : failed to unmount %s: path %s err: %v",
+				vol.Name, UmountPath, err,
+			)
+			return err
+		}
+		if err := os.Remove(UmountPath); err != nil {
+			klog.Warningf("extend : failed to remove mount path vol %s err : %v", vol.Name, err)
+		}
+		klog.Infof("extend : umount done %s path %v", vol.Name, UmountPath)
+		g_vol_mounted_count[UmountPath] = 0
+	} else {
+		g_vol_mounted_count[UmountPath] = value - 1
+		klog.Infof("extend : reference count decreased, don't umount %s path %v", vol.Name, UmountPath)
 	}
-	klog.Infof("extend : umount done %s path %v", vol.Name, UmountPath)
 
 	return nil
 }
@@ -284,8 +303,16 @@ func MountDataset(vol *apis.ZFSVolume, mount *MountInfo) error {
 		if err != nil {
 			klog.Warningf("extend : error: %v", err)
 		}
+		g_vol_mounted_count_mutex.Lock()
+		defer g_vol_mounted_count_mutex.Unlock()
 		if mounted {
 			klog.Infof("extend : already mounted %s => %s", volume, MountPath)
+			value, ok := g_vol_mounted_count[MountPath]
+			if ok {
+				g_vol_mounted_count[MountPath] = value + 1
+			} else {
+				g_vol_mounted_count[MountPath] = 1
+			}
 		} else {
 			err = os.MkdirAll(MountPath, 0750)
 			if err != nil {
@@ -299,6 +326,12 @@ func MountDataset(vol *apis.ZFSVolume, mount *MountInfo) error {
 						volume, MountVolArg, string(out))
 				}
 				klog.Infof("extend : legacy mounted %s => %s", volume, MountPath)
+				value, ok := g_vol_mounted_count[MountPath]
+				if ok {
+					g_vol_mounted_count[MountPath] = value + 1
+				} else {
+					g_vol_mounted_count[MountPath] = 1
+				}
 			}
 		}
 	} else {
